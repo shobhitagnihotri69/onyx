@@ -70,7 +70,7 @@ from onyx.chat.save_chat import save_chat_turn
 from onyx.chat.stop_signal_checker import is_connected as check_stop_signal
 from onyx.chat.stop_signal_checker import reset_cancel_status
 from onyx.chat.stream_buffer import StreamBufferWriter
-from onyx.configs.app_configs import DISABLE_VECTOR_DB, INTEGRATION_TESTS_MODE
+from onyx.configs.app_configs import DEV_MODE, DISABLE_VECTOR_DB, INTEGRATION_TESTS_MODE
 from onyx.configs.chat_configs import CHAT_HEARTBEAT_INTERVAL_S
 from onyx.configs.constants import (
     DEFAULT_PERSONA_ID,
@@ -1570,7 +1570,7 @@ def _run_models(
                     _publish(
                         StreamingError(
                             error=error_msg,
-                            stack_trace=stack_trace,
+                            stack_trace=stack_trace if DEV_MODE else None,
                             error_code=info.error_code,
                             is_retryable=info.is_retryable,
                             details=_model_error_details(item, model_llm, model_idx),
@@ -1838,7 +1838,7 @@ def _stream_chat_turn(
         )
         yield StreamingError(
             error=e.client_error_msg,
-            stack_trace=stack_trace,
+            stack_trace=stack_trace if DEV_MODE else None,
             error_code=e.error_code,
             is_retryable=e.is_retryable,
             details={
@@ -1862,7 +1862,7 @@ def _stream_chat_turn(
             )
             yield StreamingError(
                 error=error_info.message,
-                stack_trace=stack_trace,
+                stack_trace=stack_trace if DEV_MODE else None,
                 error_code=error_info.error_code,
                 is_retryable=error_info.is_retryable,
                 details={
@@ -1873,7 +1873,7 @@ def _stream_chat_turn(
         else:
             yield StreamingError(
                 error="Failed to initialize the chat. Please check your configuration and try again.",
-                stack_trace=stack_trace,
+                stack_trace=stack_trace if DEV_MODE else None,
                 error_code="INIT_FAILED",
                 is_retryable=True,
             )
