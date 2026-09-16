@@ -1,6 +1,14 @@
 export enum FileTypeCategory {
   SHAREPOINT_PFX_FILE = "sharepoint_pfx_file",
+  ONEDRIVE_PFX_FILE = "onedrive_pfx_file",
 }
+
+const SHAREPOINT_PRIVATE_KEY_FIELD = "sp_private_key";
+const ONEDRIVE_PRIVATE_KEY_FIELD = "onedrive_private_key";
+const TYPED_FILE_FIELDS = new Set([
+  SHAREPOINT_PRIVATE_KEY_FIELD,
+  ONEDRIVE_PRIVATE_KEY_FIELD,
+]);
 
 export interface FileValidationRule {
   maxSizeKB?: number;
@@ -14,10 +22,7 @@ export interface FileTypeDefinition {
   description?: string;
 }
 
-export const FILE_TYPE_DEFINITIONS: Record<
-  FileTypeCategory,
-  FileTypeDefinition
-> = {
+export const FILE_TYPE_DEFINITIONS = {
   [FileTypeCategory.SHAREPOINT_PFX_FILE]: {
     category: FileTypeCategory.SHAREPOINT_PFX_FILE,
     validation: {
@@ -27,7 +32,16 @@ export const FILE_TYPE_DEFINITIONS: Record<
     description:
       "Please upload a .pfx file containing the private key for SharePoint. The file size must be under 10KB.",
   },
-};
+  [FileTypeCategory.ONEDRIVE_PFX_FILE]: {
+    category: FileTypeCategory.ONEDRIVE_PFX_FILE,
+    validation: {
+      maxSizeKB: 10,
+      allowedExtensions: [".pfx"],
+    },
+    description:
+      "Please upload a .pfx file containing the private key for OneDrive. The file size must be under 10KB.",
+  },
+} satisfies Record<FileTypeCategory, FileTypeDefinition>;
 
 export class TypedFile {
   constructor(
@@ -104,18 +118,18 @@ export function createTypedFile(
 }
 
 export function isTypedFileField(fieldKey: string): boolean {
-  // Define which fields should be typed files
-  const typedFileFields = new Set(["sp_private_key"]);
-  return typedFileFields.has(fieldKey);
+  return TYPED_FILE_FIELDS.has(fieldKey);
 }
 
 // Get the appropriate file type definition for a field
 export function getFileTypeDefinitionForField(
   fieldKey: string
 ): FileTypeCategory | null {
-  const fieldToTypeMap: Record<string, FileTypeCategory> = {
-    sp_private_key: FileTypeCategory.SHAREPOINT_PFX_FILE,
-  };
-
-  return fieldToTypeMap[fieldKey] || null;
+  if (fieldKey === SHAREPOINT_PRIVATE_KEY_FIELD) {
+    return FileTypeCategory.SHAREPOINT_PFX_FILE;
+  }
+  if (fieldKey === ONEDRIVE_PRIVATE_KEY_FIELD) {
+    return FileTypeCategory.ONEDRIVE_PFX_FILE;
+  }
+  return null;
 }
