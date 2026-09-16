@@ -3,16 +3,19 @@
 from collections import defaultdict
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from onyx.configs.constants import DocumentSource
 from onyx.connectors.models import HierarchyNode as PydanticHierarchyNode
-from onyx.db.enums import HierarchyNodeType
+from onyx.db.enums import AccessType, ConnectorCredentialPairStatus, HierarchyNodeType
 from onyx.db.models import (
+    ConnectorCredentialPair,
+    Credential,
     Document,
     HierarchyNode,
     HierarchyNodeByConnectorCredentialPair,
@@ -537,17 +540,52 @@ def get_all_hierarchy_nodes_for_source(
     return list(db_session.execute(stmt).scalars().all())
 
 
+def _build_mit_hierarchy_access_filter(user_id: UUID | None) -> ColumnElement[bool]:
+    node_cc_pair = HierarchyNodeByConnectorCredentialPair
+    connector_access: list[ColumnElement[bool]] = [
+        ConnectorCredentialPair.access_type == AccessType.PUBLIC,
+    ]
+    if user_id is not None:
+        connector_access.append(
+            and_(
+                ConnectorCredentialPair.access_type != AccessType.SYNC,
+                Credential.user_id == user_id,
+            )
+        )
+    return or_(
+        HierarchyNode.node_type == HierarchyNodeType.SOURCE,
+        HierarchyNode.is_public.is_(True),
+        select(1)
+        .select_from(node_cc_pair)
+        .join(
+            ConnectorCredentialPair,
+            and_(
+                ConnectorCredentialPair.connector_id == node_cc_pair.connector_id,
+                ConnectorCredentialPair.credential_id == node_cc_pair.credential_id,
+            ),
+        )
+        .join(Credential, Credential.id == node_cc_pair.credential_id)
+        .where(
+            node_cc_pair.hierarchy_node_id == HierarchyNode.id,
+            ConnectorCredentialPair.status != ConnectorCredentialPairStatus.DELETING,
+            or_(*connector_access),
+        )
+        .exists(),
+    )
+
+
 def _get_accessible_hierarchy_nodes_for_source(
     db_session: Session,
     source: DocumentSource,
     user_email: str,  # noqa: ARG001
     external_group_ids: list[str],  # noqa: ARG001
-    user_id: UUID | None = None,  # noqa: ARG001
+    user_id: UUID | None = None,
 ) -> list[HierarchyNode]:
-    """MIT version: return all non-stub nodes for the source."""
+    """MIT version: non-stub nodes for the source the user can access."""
     stmt = select(HierarchyNode).where(
         HierarchyNode.source == source,
         HierarchyNode.node_type != HierarchyNodeType.STUB,
+        _build_mit_hierarchy_access_filter(user_id),
     )
     stmt = stmt.order_by(HierarchyNode.display_name)
     return list(db_session.execute(stmt).scalars().all())
@@ -560,10 +598,7 @@ def get_accessible_hierarchy_nodes_for_source(
     external_group_ids: list[str],
     user_id: UUID | None = None,
 ) -> list[HierarchyNode]:
-    """Get source nodes allowed by the edition-specific access policy.
-
-    EE combines node ACLs with associated connector permissions; MIT returns all.
-    """
+    """Get source nodes allowed by the edition-specific access policy."""
     versioned_fn = fetch_versioned_implementation(
         "onyx.db.hierarchy", "_get_accessible_hierarchy_nodes_for_source"
     )
@@ -587,9 +622,9 @@ def _search_accessible_hierarchy_nodes(
     user_email: str,  # noqa: ARG001
     external_group_ids: list[str],  # noqa: ARG001
     limit: int = HIERARCHY_NODE_SEARCH_LIMIT,
-    user_id: UUID | None = None,  # noqa: ARG001
+    user_id: UUID | None = None,
 ) -> list[HierarchyNode]:
-    """MIT version: case-insensitive display_name search without ACL filtering."""
+    """MIT version: access-filtered case-insensitive display_name search."""
     pattern = f"%{escape_like_pattern(query)}%"
     stmt = (
         select(HierarchyNode)
@@ -598,6 +633,7 @@ def _search_accessible_hierarchy_nodes(
                 [HierarchyNodeType.STUB, HierarchyNodeType.SOURCE]
             ),
             HierarchyNode.display_name.ilike(pattern, escape="\\"),
+            _build_mit_hierarchy_access_filter(user_id),
         )
         .order_by(HierarchyNode.display_name)
         .limit(limit)
@@ -618,7 +654,6 @@ def search_accessible_hierarchy_nodes(
 ) -> list[HierarchyNode]:
     """Search hierarchy nodes by display_name substring, ACL-gated.
 
-    MIT version returns all matching nodes; EE version applies permission filtering.
     STUB and SOURCE nodes are always excluded.
     """
     versioned_fn = fetch_versioned_implementation(
@@ -636,15 +671,18 @@ def search_accessible_hierarchy_nodes(
 
 
 def _filter_accessible_hierarchy_node_ids(
-    db_session: Session,  # noqa: ARG001
+    db_session: Session,
     node_ids: list[int],
     user_email: str,  # noqa: ARG001
     external_group_ids: list[str],  # noqa: ARG001
-    user_id: UUID | None = None,  # noqa: ARG001
+    user_id: UUID | None = None,
 ) -> set[int]:
-    """MIT version: hierarchy nodes carry no permission filtering — all
-    requested ids pass. The EE version applies the access filter."""
-    return set(node_ids)
+    """MIT version: keep only the node ids the user can access."""
+    stmt = select(HierarchyNode.id).where(
+        HierarchyNode.id.in_(node_ids),
+        _build_mit_hierarchy_access_filter(user_id),
+    )
+    return set(db_session.execute(stmt).scalars().all())
 
 
 def filter_accessible_hierarchy_node_ids(
@@ -654,8 +692,7 @@ def filter_accessible_hierarchy_node_ids(
     external_group_ids: list[str],
     user_id: UUID | None = None,
 ) -> set[int]:
-    """Return the subset of ``node_ids`` the user can access (EE filters,
-    MIT passes everything through)."""
+    """Return the subset of ``node_ids`` the user can access."""
     if not node_ids:
         return set()
     versioned_fn = fetch_versioned_implementation(

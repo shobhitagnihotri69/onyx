@@ -1,24 +1,33 @@
 """Tests hierarchy node and document visibility through connector permissions."""
 
 from collections.abc import Generator
+from typing import Literal
 from uuid import UUID, uuid4
 
 import pytest
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import text, update
+from sqlalchemy import insert, update
 from sqlalchemy.orm import Session
 
 from ee.onyx.db.hierarchy import _get_accessible_hierarchy_nodes_for_source
 from onyx.configs.constants import DocumentSource
+from onyx.db import hierarchy as mit_hierarchy
 from onyx.db.document import get_accessible_documents_for_hierarchy_node_paginated
-from onyx.db.enums import AccessType, AccountType, HierarchyNodeType
+from onyx.db.enums import (
+    AccessType,
+    AccountType,
+    ConnectorCredentialPairStatus,
+    HierarchyNodeType,
+)
 from onyx.db.hierarchy import get_source_hierarchy_node
 from onyx.db.models import (
+    ConnectorCredentialPair,
     Credential,
     Document,
     DocumentByConnectorCredentialPair,
     HierarchyNode,
     HierarchyNodeByConnectorCredentialPair,
+    User,
     User__UserGroup,
     UserGroup,
     UserGroup__ConnectorCredentialPair,
@@ -31,6 +40,7 @@ class ConnectorAccessSeed(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     node: HierarchyNode
+    cc_pair_id: int
     document_id: str
     owner_id: UUID
     owner_email: str
@@ -124,14 +134,8 @@ def connector_access_seed(
         for kind in ("owner", "member", "outsider")
     ]
     db_session.execute(
-        text(
-            'INSERT INTO "user" '
-            "(id, email, hashed_password, is_active, is_superuser, is_verified, "
-            "account_type) "
-            "VALUES (:id, :email, :hashed_password, :is_active, :is_superuser, "
-            ":is_verified, :account_type)"
-        ),
-        [user.model_dump(mode="json") for user in user_rows],
+        insert(User),
+        [user.model_dump() for user in user_rows],
     )
     owner, member, outsider = user_rows
 
@@ -186,6 +190,7 @@ def connector_access_seed(
 
     yield ConnectorAccessSeed(
         node=node,
+        cc_pair_id=cc_pair.id,
         document_id=document.id,
         owner_id=owner.id,
         owner_email=owner.email,
@@ -410,3 +415,69 @@ def test_source_node_always_accessible(
         source_node.is_public = original_is_public
         db_session.delete(private_child)
         db_session.commit()
+
+
+@pytest.mark.parametrize("operation", ["list", "search", "filter"])
+@pytest.mark.parametrize("caller", ["owner", "member", "outsider", "anonymous"])
+def test_mit_hierarchy_connector_access(
+    db_session: Session,
+    connector_access_seed: ConnectorAccessSeed,
+    operation: Literal["list", "search", "filter"],
+    caller: Literal["owner", "member", "outsider", "anonymous"],
+) -> None:
+    seed = connector_access_seed
+    user_id: UUID | None = {
+        "owner": seed.owner_id,
+        "member": seed.member_id,
+        "outsider": seed.outsider_id,
+        "anonymous": None,
+    }[caller]
+
+    def visible_ids() -> set[int]:
+        if operation == "list":
+            return {
+                node.id
+                for node in mit_hierarchy._get_accessible_hierarchy_nodes_for_source(
+                    db_session, DocumentSource.GOOGLE_DRIVE, "", [], user_id=user_id
+                )
+            }
+        if operation == "search":
+            return {
+                node.id
+                for node in mit_hierarchy._search_accessible_hierarchy_nodes(
+                    db_session, seed.node.display_name, None, "", [], user_id=user_id
+                )
+            }
+        return mit_hierarchy._filter_accessible_hierarchy_node_ids(
+            db_session, [seed.node.id], "", [], user_id=user_id
+        )
+
+    seed.node.external_user_emails = [seed.outsider_email]
+    seed.node.external_user_group_ids = ["external-group"]
+    db_session.flush()
+    assert (seed.node.id in visible_ids()) == (caller == "owner")
+
+    db_session.execute(
+        update(ConnectorCredentialPair)
+        .where(ConnectorCredentialPair.id == seed.cc_pair_id)
+        .values(access_type=AccessType.SYNC)
+    )
+    assert seed.node.id not in visible_ids()
+
+    db_session.execute(
+        update(ConnectorCredentialPair)
+        .where(ConnectorCredentialPair.id == seed.cc_pair_id)
+        .values(access_type=AccessType.PUBLIC)
+    )
+    assert seed.node.id in visible_ids()
+
+    db_session.execute(
+        update(ConnectorCredentialPair)
+        .where(ConnectorCredentialPair.id == seed.cc_pair_id)
+        .values(status=ConnectorCredentialPairStatus.DELETING)
+    )
+    assert seed.node.id not in visible_ids()
+
+    seed.node.is_public = True
+    db_session.flush()
+    assert seed.node.id in visible_ids()
