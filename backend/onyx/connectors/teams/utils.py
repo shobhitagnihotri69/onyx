@@ -1,6 +1,8 @@
+import re
 import time
 from collections.abc import Generator
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from typing import Any
 
 import requests
@@ -293,6 +295,41 @@ def fetch_site_url(graph_client: GraphClient, site_id: str) -> str:
 def fetch_drive_name(graph_client: GraphClient, drive_id: str) -> str:
     """The document library name SharePoint REST looks the list up by."""
     return _retry(graph_client=graph_client, request_url=f"drives/{drive_id}")["name"]
+
+
+# An image pasted into a message is hosted content, and its img tag points at
+# the Graph route that serves the bytes. Images linked from elsewhere carry no
+# such route and are left out.
+_HOSTED_CONTENT_PATH = re.compile(r"/hostedContents/[^/?#]+/\$value$")
+
+
+class _ImageSources(HTMLParser):
+    """The src of every img tag, in body order, with entities decoded."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sources: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "img":
+            return
+        src = dict(attrs).get("src")
+        if src:
+            self.sources.append(src)
+
+
+def hosted_content_urls(body_html: str, graph_root: str) -> list[str]:
+    """The urls of the images pasted into a message, in body order. Only urls
+    under this tenant's Graph root count: the body is user content, so a src
+    shaped like a hosted content route on another host is not followed."""
+    parser = _ImageSources()
+    parser.feed(body_html)
+    prefix = graph_root.rstrip("/") + "/"
+    return [
+        src
+        for src in parser.sources
+        if src.startswith(prefix) and _HOSTED_CONTENT_PATH.search(src)
+    ]
 
 
 def fetch_replies(

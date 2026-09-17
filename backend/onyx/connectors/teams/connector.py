@@ -5,6 +5,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
+from hashlib import sha256
 from itertools import chain
 from typing import Any
 from urllib.parse import urlsplit
@@ -21,7 +22,7 @@ from office365.teams.team import Team
 from onyx.access.models import ExternalAccess
 from onyx.access.utils import build_ext_group_name_for_onyx
 from onyx.configs.app_configs import TEAMS_CONNECTOR_ATTACHMENT_SIZE_THRESHOLD
-from onyx.configs.constants import DocumentSource
+from onyx.configs.constants import DocumentSource, FileOrigin
 from onyx.connectors.exceptions import (
     ConnectorValidationError,
     CredentialExpiredError,
@@ -38,6 +39,8 @@ from onyx.connectors.interfaces import (
 from onyx.connectors.microsoft_utils.drive_items import (
     DriveItemContentError,
     DriveItemData,
+    SizeCapExceeded,
+    download_graph_url_with_cap,
     extract_drive_item_content,
     iter_drive_items_paged,
 )
@@ -62,6 +65,7 @@ from onyx.connectors.models import (
     DocumentFailure,
     EntityFailure,
     HierarchyNode,
+    ImageSection,
     SlimDocument,
     TextSection,
 )
@@ -80,10 +84,12 @@ from onyx.connectors.teams.utils import (
     fetch_messages,
     fetch_replies,
     fetch_site_url,
+    hosted_content_urls,
     message_delta_url,
 )
 from onyx.file_processing.file_types import OnyxMimeTypes
 from onyx.file_processing.html_utils import parse_html_page_basic
+from onyx.file_processing.image_utils import store_image_and_create_section
 from onyx.indexing.indexing_heartbeat import IndexingHeartbeatInterface
 from onyx.utils.logger import setup_logger
 from onyx.utils.threadpool_concurrency import run_with_timeout
@@ -99,6 +105,9 @@ _REST_CTX_MAX_AGE_S = 30 * 60
 # Channel files are documents of their own. The prefix keeps them apart from a
 # SharePoint connector indexing the same library, which uses the bare item id.
 FILE_DOCUMENT_ID_PREFIX = "teams-file:"
+
+# Each pasted image costs a download now and a vision-model call at indexing.
+_MAX_IMAGES_PER_THREAD = 20
 
 CREDENTIAL_AUTH_METHOD = "authentication_method"
 CREDENTIAL_PRIVATE_KEY = "teams_private_key"
@@ -136,6 +145,8 @@ class TeamsConnector(
         # Off by default: a channel file's readers come from SharePoint REST,
         # which needs a certificate credential and a sites grant.
         include_attachments: bool = False,
+        # Off by default: every pasted image is a download and a vision call.
+        include_inline_images: bool = False,
     ) -> None:
         if teams is None:
             teams = []
@@ -146,6 +157,9 @@ class TeamsConnector(
         self.max_workers = max_workers
         self.requested_team_list: list[str] = teams
         self.include_attachments = include_attachments
+        self.include_inline_images = include_inline_images
+        # Granted by the factory from the image analysis setting.
+        self.allow_images = False
         # Channels walked again from their first page in this attempt: a saved
         # page url Graph rejects recovers once per attempt and can never loop.
         self._restarted_channel_ids: set[str] = set()
@@ -164,6 +178,9 @@ class TeamsConnector(
         self.sharepoint_domain_suffix = resolved_env.sharepoint_domain_suffix
 
     # impls for BaseConnector
+
+    def set_allow_images(self, value: bool) -> None:
+        self.allow_images = value
 
     def load_credentials(self, credentials: dict[str, Any]) -> dict[str, Any] | None:
         self._auth_method = MicrosoftAuthMethod.parse(
@@ -402,6 +419,7 @@ class TeamsConnector(
                 self._channel_state,
                 self._channel_library if self.include_attachments else None,
                 self._index_channel_files if self.include_attachments else None,
+                self._message_images if self.include_inline_images else None,
             )
 
         checkpoint.has_more = bool(
@@ -410,6 +428,48 @@ class TeamsConnector(
             or checkpoint.todo_team_ids
         )
         return checkpoint
+
+    def _message_images(
+        self, message: Message, limit: int
+    ) -> tuple[list[ImageSection], int]:
+        """Up to ``limit`` images pasted into one message, stored for the vision
+        model, and the number of downloads that took. Nothing is downloaded while
+        image analysis is off. A refused or oversized image is skipped, anything
+        else fails the attempt so the page is retried."""
+        if not self.allow_images or not message.body.content or limit <= 0:
+            return [], 0
+        if self._acquire_token is None:
+            raise ConnectorMissingCredentialError("Teams")
+        graph_root = f"{self.graph_api_host}/v1.0"
+        urls = hosted_content_urls(message.body.content, graph_root)[:limit]
+        sections: list[ImageSection] = []
+        for url in urls:
+            try:
+                data = download_graph_url_with_cap(
+                    self._acquire_token()["access_token"],
+                    url,
+                    TEAMS_CONNECTOR_ATTACHMENT_SIZE_THRESHOLD,
+                    description=f"image of message {message.id}",
+                )
+            except SizeCapExceeded:
+                logger.warning("Skipping an oversized image of message %s", message.id)
+                continue
+            except requests.HTTPError as e:
+                if not _is_permanent(e):
+                    raise
+                logger.warning("Skipping an image of message %s: %s", message.id, e)
+                continue
+            section, _ = store_image_and_create_section(
+                image_data=data,
+                # Deterministic, so a re-index overwrites instead of piling up.
+                file_id=f"teams-image-{sha256(url.encode()).hexdigest()[:32]}",
+                display_name=f"Image in a message of {message.created_date_time:%Y-%m-%d}",
+                link=message.web_url,
+                media_type=_image_media_type(data),
+                file_origin=FileOrigin.CONNECTOR,
+            )
+            sections.append(section)
+        return sections, len(urls)
 
     def _channel_library(self, channel: ChannelRef) -> "_ChannelLibrary":
         """Where the channel's files live, resolved through Graph."""
@@ -799,20 +859,48 @@ def _modified_at(message: Message) -> datetime:
     return message.last_modified_date_time or message.created_date_time
 
 
+# The images of one message within a budget, and the downloads charged to it.
+_MessageImages = Callable[[Message, int], tuple[list[ImageSection], int]]
+
+# Graph names no trustworthy type on the hosted content route, so the type is
+# read off the bytes. Pasted images are screenshots and photos.
+_IMAGE_MAGIC = (
+    (b"\x89PNG", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF8", "image/gif"),
+)
+
+
+def _image_media_type(data: bytes) -> str:
+    for magic, media_type in _IMAGE_MAGIC:
+        if data.startswith(magic):
+            return media_type
+    return "application/octet-stream"
+
+
 def _convert_thread_to_document(
     channel: ChannelRef,
     root: Message,
     replies: list[Message],
     expert_infos: list[BasicExpertInfo],
     external_access: ExternalAccess,
+    message_images: _MessageImages | None = None,
 ) -> Document:
-    """A thread (the root message and its replies) is one document, oldest first."""
+    """A thread (the root message and its replies) is one document, oldest
+    first, each message's text followed by the images pasted into it."""
     messages = sorted([root, *replies], key=lambda m: m.created_date_time)
-    sections = [
-        section
-        for message in messages
-        if message.is_indexable and (section := _message_section(message))
-    ]
+    sections: list[TextSection | ImageSection] = []
+    images_left = _MAX_IMAGES_PER_THREAD
+    for message in messages:
+        if not message.is_indexable:
+            continue
+        if section := _message_section(message):
+            sections.append(section)
+        if message_images is None:
+            continue
+        images, downloads = message_images(message, images_left)
+        images_left -= downloads
+        sections.extend(images)
     # The slim walk lists every indexable root, so a thread edited down to no
     # text must still replace its document or the old text would outlive it.
     if not sections:
@@ -1211,6 +1299,7 @@ def _walk_channel_page(
     state_cache: dict[str, _ChannelState],
     open_library: Callable[[ChannelRef], _ChannelLibrary] | None,
     index_files: _IndexFiles | None,
+    message_images: _MessageImages | None = None,
 ) -> Iterator[Document | ConnectorFailure]:
     """One page of the current channel's threads, and after the last page the
     channel's files. Moves the checkpoint to the next page, or off the channel
@@ -1299,6 +1388,7 @@ def _walk_channel_page(
             replies=replies,
             expert_infos=expert_infos,
             external_access=external_access,
+            message_images=message_images,
         )
 
     checkpoint.next_messages_url = next_url

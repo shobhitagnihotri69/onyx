@@ -1045,6 +1045,17 @@ export const connectorConfigs: Record<
           "with the readers SharePoint grants them. Needs a certificate " +
           "credential and the Sites.Read.All application permission."
       ),
+      {
+        type: "checkbox",
+        query: "Include inline images?",
+        label: "Include Inline Images",
+        name: "include_inline_images",
+        description:
+          "Index the images pasted into channel messages with their thread. " +
+          "Needs no extra permission. Nothing is downloaded while image " +
+          "extraction and analysis is off in the search settings.",
+        default: false,
+      },
     ],
     advanced_values: [
       {
@@ -2308,6 +2319,7 @@ export interface SharepointConfig {
 export interface TeamsConfig {
   teams?: string[];
   include_attachments?: boolean;
+  include_inline_images?: boolean;
   authority_host?: string;
   graph_api_host?: string;
 }
